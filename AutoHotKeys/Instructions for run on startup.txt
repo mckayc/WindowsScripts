@@ -1,0 +1,19 @@
+Press Win + R to open the Run dialog.
+
+Type:
+
+shell:startup
+
+
+…and hit Enter.
+This opens your personal Startup folder (for your Windows user account).
+The full path will look like:
+
+C:\Users\<YourName>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup
+
+
+Copy your script (for example, OBS_WebcamZoom.ahk) or a shortcut to it into this folder.
+
+To create a shortcut: Right-click the .ahk file → Create shortcut → move that shortcut into the Startup folder.
+
+✅ Now the script will run automatically each time you log in.

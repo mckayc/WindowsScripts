@@ -23,13 +23,13 @@ ZoomAllCams(zoomLevel)
     ToolTip
 }
 
-; ---------- Hotkeys: Ctrl + Numpad4–9 (50–74) ----------
-^Numpad4::ZoomAllCams(50)
-^Numpad5::ZoomAllCams(55)
-^Numpad6::ZoomAllCams(60)
-^Numpad7::ZoomAllCams(65)
-^Numpad8::ZoomAllCams(70)
-^Numpad9::ZoomAllCams(74)
+; ---------- Hotkeys: Ctrl + Win + Numpad4–9 (50–74) ----------
+^#Numpad4::ZoomAllCams(50)
+^#Numpad5::ZoomAllCams(55)
+^#Numpad6::ZoomAllCams(60)
+^#Numpad7::ZoomAllCams(65)
+^#Numpad8::ZoomAllCams(70)
+^#Numpad9::ZoomAllCams(74)
 
 ; ---------- Hotkeys: Ctrl + Alt + Numpad4–9 (75–98) ----------
 ^!Numpad4::ZoomAllCams(75)
