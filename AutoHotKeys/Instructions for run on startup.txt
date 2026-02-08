@@ -10,6 +10,7 @@ This opens your personal Startup folder (for your Windows user account).
 The full path will look like:
 
 C:\Users\<YourName>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup
+C:\ProgramData\Microsoft\Windows\Start Menu\ also works
 
 
 Copy your script (for example, OBS_WebcamZoom.ahk) or a shortcut to it into this folder.

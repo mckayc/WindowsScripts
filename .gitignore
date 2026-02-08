@@ -1,0 +1,24 @@
+# --- Executables ---
+CamParam.exe
+*.exe
+
+# --- Logs & Folders ---
+logs/
+*.log
+
+# --- Temporary Capture Files ---
+temp_scan.txt
+temp_sync_*.txt
+cam_out.txt
+capture_out.txt
+
+# --- System & IDE Files ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Optional: Local Settings ---
+# Uncomment the line below if you want users to keep 
+# their own local settings.ini without syncing to GitHub
+# settings.ini
