@@ -20,6 +20,9 @@ global C2_Name := "Overhead",     C2_SN := "S3-25400090", C2_Min := 50, C2_Max :
 ; --- Camera 3: Side ---
 global C3_Name := "Side",         C3_SN := "S3-25400004", C3_Min := 50, C3_Max := 98, C3_ID := -1, C3_Pct := 0
 
+; --- Camera 4: Yololiv S7 ---
+global C4_Name := "Yololiv S7",   C4_SN := "Y-CAM-26020026", C4_Min := 50, C4_Max := 98, C4_ID := -1, C4_Pct := 0
+
 global LogPath := A_ScriptDir . "\" . LogFolder . "\" . LogFileName
 
 ; ==============================================================================
@@ -53,11 +56,15 @@ return
 
 ; Cam 2 (Overhead)
 ^#2:: AdjustAndApply(2, ZoomStepPct)
-^#w:: AdjustAndApply(2, -ZoomStepPct) ; Use 'S' to avoid Windows 'W' conflict
+^#w:: AdjustAndApply(2, -ZoomStepPct)
 
 ; Cam 3 (Side)
 ^#3:: AdjustAndApply(3, ZoomStepPct)
 ^#e:: AdjustAndApply(3, -ZoomStepPct)
+
+; Cam 4 (Yololiv S7)
+^#4:: AdjustAndApply(4, ZoomStepPct)
+^#d:: AdjustAndApply(4, -ZoomStepPct)
 
 ; Re-sync
 ^#r:: 
@@ -75,7 +82,7 @@ InitializeCameras() {
     RunWait, %ComSpec% /c ""%A_ScriptDir%\%ExeName%" > "%TempFile%" 2>&1", , Hide
     FileRead, OutputVar, %TempFile%
 
-    Loop, 3 {
+    Loop, 4 {
         n := A_Index
         sn := C%n%_SN
         C%n%_ID := -1 
@@ -93,7 +100,7 @@ InitializeCameras() {
 }
 
 MultiAdjust(Step) {
-    Loop, 3
+    Loop, 4
         AdjustAndApply(A_Index, Step)
 }
 
@@ -125,7 +132,6 @@ AdjustAndApply(n, Step) {
     RunCmd := """" . FullExePath . """ device " . thisID . " zoom " . HWVal
     Run, %RunCmd%, , Hide
     
-    ; ToolTip: Name, Percentage, and exact Hardware level
     ToolTip, % thisName . "`nZoom: " . thisPct . "% (Level: " . HWVal . ")", (n*220)-180, 20, n
     SetTimer, RemoveToolTips, -2500
     LogWrite("Adjusted " . thisName . " to " . thisPct . "% (" . HWVal . ")")
@@ -162,4 +168,5 @@ RemoveToolTips:
     ToolTip, , , , 1
     ToolTip, , , , 2
     ToolTip, , , , 3
+    ToolTip, , , , 4
 return
