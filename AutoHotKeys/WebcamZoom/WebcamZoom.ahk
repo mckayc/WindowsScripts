@@ -1,3 +1,4 @@
+#Requires AutoHotkey v1.1.36+
 #NoEnv
 #SingleInstance Force
 #UseHook On
@@ -5,11 +6,12 @@ SendMode Input
 SetWorkingDir %A_ScriptDir%
 
 ; ============================================================
-; YoloCam S3 + Yololiv S7 Zoom Controller
+; YoloCam S3 + Yololiv S7 Zoom + Focus Controller
 ; AutoHotkey v1.1.36.02 Unicode 64-bit
 ; ============================================================
 
 global ZoomStepPct := 5
+
 
 ; ============================================================
 ; S3 SETTINGS
@@ -25,11 +27,13 @@ global S3Zoom1 := 0
 global S3Zoom2 := 0
 global S3Zoom3 := 0
 
+
 ; ============================================================
 ; S7 SETTINGS
 ; ============================================================
 
 global S7Serial := "Y-CAM-26020026"
+
 global S7Min := 50
 global S7Max := 98
 global S7ID := -1
@@ -37,9 +41,24 @@ global S7Zoom := 50
 
 global CamParamExe := A_ScriptDir . "\CamParam.exe"
 
-; S7 network control
+
+; ============================================================
+; S7 FOCUS NETWORK SETTINGS
+; ============================================================
+
 global S7FocusIP := "192.168.127.10"
 global S7FocusPort := 12345
+
+; The captured application protocol uses an incrementing
+; transaction counter.
+global S7FocusCounter := 0x31
+
+; Persistent TCP socket.
+global S7FocusSocket := -1
+
+; Winsock initialization state.
+global S7WinsockStarted := false
+
 
 ; ============================================================
 ; LOGGING
@@ -65,6 +84,7 @@ Log("S3 IP3: " . S3IP3)
 Log("S7 Serial: " . S7Serial)
 Log("S7 Focus IP: " . S7FocusIP)
 Log("S7 Focus Port: " . S7FocusPort)
+Log("S7 Focus Counter: " . Format("{:02X}", S7FocusCounter))
 Log("========================================")
 
 InitializeCameras()
@@ -76,7 +96,10 @@ return
 ; HOTKEYS
 ; ============================================================
 
+
+; ============================================================
 ; CAMERA 1 - TALKING HEAD
+; ============================================================
 
 ^#1::
     AdjustS3(1, 1)
@@ -87,7 +110,9 @@ return
 return
 
 
+; ============================================================
 ; CAMERA 2 - OVERHEAD
+; ============================================================
 
 ^#2::
     AdjustS3(2, 1)
@@ -98,7 +123,9 @@ return
 return
 
 
+; ============================================================
 ; CAMERA 3 - SIDE
+; ============================================================
 
 ^#3::
     AdjustS3(3, 1)
@@ -109,7 +136,9 @@ return
 return
 
 
-; CAMERA 4 - YOLOLIV S7
+; ============================================================
+; CAMERA 4 - YOLOLIV S7 ZOOM
+; ============================================================
 
 ^#4::
     AdjustS7(1)
@@ -120,7 +149,22 @@ return
 return
 
 
+; ============================================================
+; S7 FOCUS
+; ============================================================
+
+^#f::
+    S7FaceFocus()
+return
+
+^#a::
+    S7AutoFocusCenter()
+return
+
+
+; ============================================================
 ; ALL CAMERAS - ZOOM IN
+; ============================================================
 
 ^#=::
     AdjustS3(1, 1)
@@ -130,7 +174,9 @@ return
 return
 
 
+; ============================================================
 ; ALL CAMERAS - ZOOM OUT
+; ============================================================
 
 ^#-::
     AdjustS3(1, -1)
@@ -140,32 +186,12 @@ return
 return
 
 
+; ============================================================
 ; RE-SYNC ALL
+; ============================================================
 
 ^#r::
     InitializeCameras()
-return
-
-
-; ============================================================
-; S7 AUTOFOCUS HOTKEYS
-; ============================================================
-
-; FACE FOCUS
-;
-; Ctrl + Win + F
-
-^#f::
-    S7FaceFocus()
-return
-
-
-; AUTO-FOCUS CENTER
-;
-; Ctrl + Win + A
-
-^#a::
-    S7AutoFocusCenter()
 return
 
 
@@ -238,13 +264,6 @@ GetS3Zoom(IP)
 
     TempFile := A_Temp . "\yolocam_s3_" . A_TickCount . ".txt"
 
-    ; Build a fully quoted CMD command.
-    ;
-    ; /S /C ""EXE" arguments > "file" 2>&1"
-    ;
-    ; RunWait with Hide prevents any terminal window from
-    ; appearing.
-
     Command := ComSpec . " /S /C """"" . S3Exe . """ " . IP . " get > """ . TempFile . """ 2>&1"""
 
     Log("S3 GET command: " . Command)
@@ -264,11 +283,6 @@ GetS3Zoom(IP)
     FileDelete, %TempFile%
 
     Log("S3 GET output [" . IP . "]: [" . Output . "]")
-
-    ; Expected output:
-    ;
-    ; 1.00 0.500 0.500
-    ; 1.25 0.500 0.500
 
     if RegExMatch(Output, "^\s*(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)", Match)
     {
@@ -293,8 +307,6 @@ SetS3Zoom(IP, Pct)
 {
     global S3Exe
 
-    ; Convert:
-    ;
     ; 0%   = 1.00x
     ; 25%  = 1.75x
     ; 50%  = 2.50x
@@ -308,7 +320,6 @@ SetS3Zoom(IP, Pct)
 
     Log("S3 SET command: " . Command)
 
-    ; Run directly and hidden.
     RunWait, %Command%, %A_ScriptDir%, Hide
 
     return true
@@ -349,11 +360,6 @@ SyncS3(CameraNum)
         Log("SYNC FAILED - Camera " . CameraNum . " - " . IP)
         return false
     }
-
-    ; Convert S3 zoom factor to percentage.
-    ;
-    ; 1.00 = 0%
-    ; 4.00 = 100%
 
     Pct := Round(((ZoomFactor - 1.0) / 3.0) * 100)
 
@@ -462,10 +468,6 @@ InitializeS7()
 
     TempFile := A_Temp . "\camparam_scan_" . A_TickCount . ".txt"
 
-    ; Hidden command:
-    ;
-    ; CamParam.exe > temporary-file
-
     Command := ComSpec . " /S /C """"" . CamParamExe . """ > """ . TempFile . """ 2>&1"""
 
     Log("S7 scan command: " . Command)
@@ -517,7 +519,7 @@ InitializeS7()
 
 
 ; ============================================================
-; S7 - SYNC
+; S7 - SYNC ZOOM
 ; ============================================================
 
 SyncS7()
@@ -656,92 +658,184 @@ AdjustS7(Direction)
 
 S7FaceFocus()
 {
-    global S7FocusIP
-    global S7FocusPort
-
-    ; Captured Face Focus payload:
-    ;
-    ; 08 01 00 00 12 00 00 00 a5 00 00 00
-    ; 0a af 08 02 10 31 28 17 32 02 08 04
-    ; 28 5a
-
-    Data := Chr(0x08) . Chr(0x01) . Chr(0x00) . Chr(0x00) . Chr(0x12) . Chr(0x00) . Chr(0x00) . Chr(0x00) . Chr(0xA5) . Chr(0x00) . Chr(0x00) . Chr(0x00) . Chr(0x0A) . Chr(0xAF) . Chr(0x08) . Chr(0x02) . Chr(0x10) . Chr(0x31) . Chr(0x28) . Chr(0x17) . Chr(0x32) . Chr(0x02) . Chr(0x08) . Chr(0x04) . Chr(0x28) . Chr(0x5A)
-
-    Log("S7 Face Focus command")
-
-    if SendS7FocusPacket(S7FocusIP, S7FocusPort, Data)
-    {
-        Log("S7 Face Focus: SUCCESS")
-
-        ToolTip, S7 Face Focus
-        SetTimer, RemoveToolTip, -1000
-    }
-    else
-    {
-        Log("S7 Face Focus: FAILED")
-
-        ToolTip, S7 Face Focus FAILED
-        SetTimer, RemoveToolTip, -1500
-    }
+    ; 04 = Face Focus
+    SendS7FocusCommand(4, "Face Focus")
 }
 
 
 ; ============================================================
-; S7 - AUTOFOCUS CENTER
+; S7 - AUTO FOCUS CENTER
 ; ============================================================
 
 S7AutoFocusCenter()
 {
-    global S7FocusIP
-    global S7FocusPort
-
-    ; Captured Auto-Focus Center payload:
-    ;
-    ; 08 01 00 00 12 00 00 00 a5 00 00 00
-    ; 0a af 08 02 10 33 28 17 32 02 08 03
-    ; 2d 5a
-
-    Data := Chr(0x08) . Chr(0x01) . Chr(0x00) . Chr(0x00) . Chr(0x12) . Chr(0x00) . Chr(0x00) . Chr(0x00) . Chr(0xA5) . Chr(0x00) . Chr(0x00) . Chr(0x00) . Chr(0x0A) . Chr(0xAF) . Chr(0x08) . Chr(0x02) . Chr(0x10) . Chr(0x33) . Chr(0x28) . Chr(0x17) . Chr(0x32) . Chr(0x02) . Chr(0x08) . Chr(0x03) . Chr(0x2D) . Chr(0x5A)
-
-    Log("S7 Auto-Focus Center command")
-
-    if SendS7FocusPacket(S7FocusIP, S7FocusPort, Data)
-    {
-        Log("S7 Auto-Focus Center: SUCCESS")
-
-        ToolTip, S7 Auto-Focus Center
-        SetTimer, RemoveToolTip, -1000
-    }
-    else
-    {
-        Log("S7 Auto-Focus Center: FAILED")
-
-        ToolTip, S7 Auto-Focus Center FAILED
-        SetTimer, RemoveToolTip, -1500
-    }
+    ; 03 = Auto-Focus Center
+    SendS7FocusCommand(3, "Auto-Focus Center")
 }
 
 
 ; ============================================================
-; S7 - SEND TCP FOCUS PACKET
+; S7 - SEND FOCUS COMMAND
 ; ============================================================
 
-SendS7FocusPacket(IP, Port, Data)
+SendS7FocusCommand(Mode, Description)
 {
-    ; --------------------------------------------------------
-    ; Initialize Winsock
-    ; --------------------------------------------------------
+    global S7FocusCounter
 
-    VarSetCapacity(WSAData, 394, 0)
+    Log("----------------------------------------")
+    Log("S7 FOCUS: " . Description)
+    Log("S7 FOCUS counter: " . Format("{:02X}", S7FocusCounter))
+    Log("S7 FOCUS mode: " . Mode)
 
-    Result := DllCall("Ws2_32\WSAStartup", "UShort", 0x0202, "Ptr", &WSAData)
-
-    if (Result != 0)
+    if !EnsureS7FocusConnection()
     {
-        Log("Winsock WSAStartup failed: " . Result)
+        Log("S7 FOCUS FAILED: Could not establish TCP connection")
+        ShowFocusStatus("S7 Focus: CONNECTION FAILED")
         return false
     }
 
+    ; ========================================================
+    ; Build the 26-byte focus packet.
+    ;
+    ; Capture format:
+    ;
+    ; 08 01 00 00 12 00 00 00
+    ; A5 00 00 00
+    ; 0A AF
+    ; 08 02
+    ; 10 COUNTER
+    ; 28 17
+    ; 32 02
+    ; 08 MODE
+    ; CHECKSUM
+    ; 5A
+    ; ========================================================
+
+    Counter := S7FocusCounter & 0xFF
+
+    ; Checksum observed in the capture:
+    ;
+    ; checksum = counter XOR mode XOR 1D
+
+    Checksum := Counter ^ Mode ^ 0x1D
+
+    VarSetCapacity(Packet, 26, 0)
+
+    NumPut(0x08, Packet,  0, "UChar")
+    NumPut(0x01, Packet,  1, "UChar")
+    NumPut(0x00, Packet,  2, "UChar")
+    NumPut(0x00, Packet,  3, "UChar")
+
+    NumPut(0x12, Packet,  4, "UChar")
+    NumPut(0x00, Packet,  5, "UChar")
+    NumPut(0x00, Packet, 6, "UChar")
+    NumPut(0x00, Packet, 7, "UChar")
+
+    NumPut(0xA5, Packet,  8, "UChar")
+    NumPut(0x00, Packet,  9, "UChar")
+    NumPut(0x00, Packet, 10, "UChar")
+    NumPut(0x00, Packet, 11, "UChar")
+
+    NumPut(0x0A, Packet, 12, "UChar")
+    NumPut(0xAF, Packet, 13, "UChar")
+
+    NumPut(0x08, Packet, 14, "UChar")
+    NumPut(0x02, Packet, 15, "UChar")
+
+    NumPut(0x10, Packet, 16, "UChar")
+    NumPut(Counter, Packet, 17, "UChar")
+
+    NumPut(0x28, Packet, 18, "UChar")
+    NumPut(0x17, Packet, 19, "UChar")
+
+    NumPut(0x32, Packet, 20, "UChar")
+    NumPut(0x02, Packet, 21, "UChar")
+
+    NumPut(0x08, Packet, 22, "UChar")
+    NumPut(Mode,  Packet, 23, "UChar")
+
+    NumPut(Checksum, Packet, 24, "UChar")
+    NumPut(0x5A, Packet, 25, "UChar")
+
+    Hex := S7BufferToHex(Packet, 26)
+
+    Log("S7 FOCUS TX: " . Hex)
+
+    ; ========================================================
+    ; Send 26-byte command.
+    ; ========================================================
+
+    Sent := DllCall("Ws2_32\send", "Ptr", S7FocusSocket, "Ptr", &Packet, "Int", 26, "Int", 0, "Int")
+
+    if (Sent != 26)
+    {
+        ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+        Log("S7 FOCUS SEND FAILED. Sent=" . Sent . " Error=" . ErrorCode)
+
+        CloseS7FocusConnection()
+
+        ShowFocusStatus("S7 Focus: SEND FAILED")
+
+        return false
+    }
+
+    Log("S7 FOCUS TX OK: 26 bytes")
+
+    ; ========================================================
+    ; Read the camera response.
+    ; ========================================================
+
+    ReceiveS7FocusResponse()
+
+    ; Increment the application transaction counter.
+    S7FocusCounter := (S7FocusCounter + 1) & 0xFF
+
+    Log("S7 FOCUS next counter: " . Format("{:02X}", S7FocusCounter))
+    Log("----------------------------------------")
+
+    ShowFocusStatus("S7 Focus: " . Description)
+
+    return true
+}
+
+
+; ============================================================
+; S7 - ENSURE FOCUS TCP CONNECTION
+; ============================================================
+
+EnsureS7FocusConnection()
+{
+    global S7FocusIP
+    global S7FocusPort
+    global S7FocusSocket
+    global S7WinsockStarted
+
+    if (S7FocusSocket != -1)
+        return true
+
+    Log("S7 FOCUS: Opening persistent TCP connection")
+
+    ; --------------------------------------------------------
+    ; Start Winsock
+    ; --------------------------------------------------------
+
+    if !S7WinsockStarted
+    {
+        VarSetCapacity(WSAData, 400, 0)
+
+        Result := DllCall("Ws2_32\WSAStartup", "UShort", 0x0202, "Ptr", &WSAData, "Int")
+
+        if (Result != 0)
+        {
+            Log("S7 FOCUS: WSAStartup failed: " . Result)
+            return false
+        }
+
+        S7WinsockStarted := true
+
+        Log("S7 FOCUS: Winsock initialized")
+    }
 
     ; --------------------------------------------------------
     ; Create TCP socket
@@ -753,100 +847,164 @@ SendS7FocusPacket(IP, Port, Data)
     {
         ErrorCode := DllCall("Ws2_32\WSAGetLastError")
 
-        Log("S7 socket creation failed: " . ErrorCode)
-
-        DllCall("Ws2_32\WSACleanup")
+        Log("S7 FOCUS: socket() failed: " . ErrorCode)
 
         return false
     }
 
+    ; --------------------------------------------------------
+    ; Receive timeout = 500 ms
+    ; --------------------------------------------------------
+
+    Timeout := 500
+
+    DllCall("Ws2_32\setsockopt", "Ptr", Socket, "Int", 0xFFFF, "Int", 0x1006, "Ptr", &Timeout, "Int", 4, "Int")
 
     ; --------------------------------------------------------
     ; Build sockaddr_in
     ; --------------------------------------------------------
 
-    VarSetCapacity(SockAddr, 16, 0)
+    VarSetCapacity(SocketAddress, 16, 0)
 
-    ; AF_INET
-    NumPut(2, SockAddr, 0, "UShort")
+    NumPut(2, SocketAddress, 0, "UShort")
 
-    ; Port
-    NetworkPort := DllCall("Ws2_32\htons", "UShort", Port, "UShort")
+    PortNetwork := DllCall("Ws2_32\htons", "UShort", S7FocusPort, "UShort")
 
-    NumPut(NetworkPort, SockAddr, 2, "UShort")
+    NumPut(PortNetwork, SocketAddress, 2, "UShort")
 
-    ; IP address
-    IPAddress := DllCall("Ws2_32\inet_addr", "AStr", IP, "UInt")
+    IPAddress := DllCall("Ws2_32\inet_addr", "AStr", S7FocusIP, "UInt")
 
-    if (IPAddress = 0xFFFFFFFF)
-    {
-        Log("S7 invalid IP address: " . IP)
-
-        DllCall("Ws2_32\closesocket", "Ptr", Socket)
-        DllCall("Ws2_32\WSACleanup")
-
-        return false
-    }
-
-    NumPut(IPAddress, SockAddr, 4, "UInt")
-
+    NumPut(IPAddress, SocketAddress, 4, "UInt")
 
     ; --------------------------------------------------------
     ; Connect
     ; --------------------------------------------------------
 
-    Result := DllCall("Ws2_32\connect", "Ptr", Socket, "Ptr", &SockAddr, "Int", 16)
+    Result := DllCall("Ws2_32\connect", "Ptr", Socket, "Ptr", &SocketAddress, "Int", 16, "Int")
 
     if (Result != 0)
     {
         ErrorCode := DllCall("Ws2_32\WSAGetLastError")
 
-        Log("S7 TCP connect failed: " . IP . ":" . Port . " error=" . ErrorCode)
+        Log("S7 FOCUS: connect() failed: " . ErrorCode)
 
         DllCall("Ws2_32\closesocket", "Ptr", Socket)
-        DllCall("Ws2_32\WSACleanup")
 
         return false
     }
 
+    S7FocusSocket := Socket
 
-    ; --------------------------------------------------------
-    ; Send payload
-    ; --------------------------------------------------------
-
-    DataLength := StrLen(Data)
-
-    Sent := DllCall("Ws2_32\send", "Ptr", Socket, "Ptr", &Data, "Int", DataLength, "Int", 0, "Int")
-
-    if (Sent != DataLength)
-    {
-        ErrorCode := DllCall("Ws2_32\WSAGetLastError")
-
-        Log("S7 TCP send failed: sent=" . Sent . " expected=" . DataLength . " error=" . ErrorCode)
-
-        DllCall("Ws2_32\closesocket", "Ptr", Socket)
-        DllCall("Ws2_32\WSACleanup")
-
-        return false
-    }
-
-
-    ; Give the camera a moment to process the command.
-
-    Sleep, 50
-
-
-    ; --------------------------------------------------------
-    ; Close connection
-    ; --------------------------------------------------------
-
-    DllCall("Ws2_32\closesocket", "Ptr", Socket)
-
-    DllCall("Ws2_32\WSACleanup")
-
-    Log("S7 TCP packet sent successfully: " . DataLength . " bytes")
+    Log("S7 FOCUS: TCP connection established")
 
     return true
+}
+
+
+; ============================================================
+; S7 - RECEIVE FOCUS RESPONSE
+; ============================================================
+
+ReceiveS7FocusResponse()
+{
+    global S7FocusSocket
+
+    VarSetCapacity(Response, 512, 0)
+
+    Received := DllCall("Ws2_32\recv", "Ptr", S7FocusSocket, "Ptr", &Response, "Int", 512, "Int", 0, "Int")
+
+    if (Received > 0)
+    {
+        Hex := S7BufferToHex(Response, Received)
+
+        Log("S7 FOCUS RX (" . Received . " bytes): " . Hex)
+
+        return true
+    }
+
+    if (Received = 0)
+    {
+        Log("S7 FOCUS RX: Camera closed TCP connection")
+
+        CloseS7FocusConnection()
+
+        return false
+    }
+
+    ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+    Log("S7 FOCUS RX: recv() error " . ErrorCode)
+
+    return false
+}
+
+
+; ============================================================
+; S7 - CLOSE FOCUS CONNECTION
+; ============================================================
+
+CloseS7FocusConnection()
+{
+    global S7FocusSocket
+
+    if (S7FocusSocket != -1)
+    {
+        Log("S7 FOCUS: Closing TCP connection")
+
+        DllCall("Ws2_32\closesocket", "Ptr", S7FocusSocket)
+
+        S7FocusSocket := -1
+    }
+}
+
+
+; ============================================================
+; S7 - CLEANUP WINSOCK
+; ============================================================
+
+CleanupS7Winsock()
+{
+    global S7WinsockStarted
+
+    if S7WinsockStarted
+    {
+        DllCall("Ws2_32\WSACleanup")
+
+        S7WinsockStarted := false
+    }
+}
+
+
+; ============================================================
+; S7 - FOCUS STATUS TOOLTIP
+; ============================================================
+
+ShowFocusStatus(Message)
+{
+    ToolTip, %Message%
+    SetTimer, RemoveToolTip, -1000
+}
+
+
+; ============================================================
+; S7 - BUFFER TO HEX
+; ============================================================
+
+S7BufferToHex(ByRef Buffer, Length)
+{
+    Hex := ""
+
+    Loop, %Length%
+    {
+        Value := NumGet(Buffer, A_Index - 1, "UChar")
+
+        if (A_Index > 1)
+            Hex .= " "
+
+        Hex .= Format("{:02X}", Value)
+    }
+
+    return Hex
 }
 
 
