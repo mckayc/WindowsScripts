@@ -50,10 +50,12 @@ global S7FocusIP := "192.168.127.10"
 global S7FocusPort := 12345
 
 ; Captured application protocol uses an incrementing
-; transaction counter.
+; transaction counter. Kept in the range 1-127 so it
+; always encodes as a single protobuf varint byte.
 global S7FocusCounter := 0x31
 
-; Persistent TCP socket.
+; TCP socket. Opened per focus command and closed after
+; the reply so unread camera events never pile up.
 global S7FocusSocket := -1
 
 ; Winsock initialization state.
@@ -65,7 +67,10 @@ global S7FocusBusy := false
 ; Focus networking timeouts.
 global S7ConnectTimeoutMs := 1000
 global S7SendTimeoutMs := 500
-global S7ReceiveTimeoutMs := 500
+
+; How long to wait for the camera's reply to a request.
+; Face-tracking events arriving meanwhile are skipped.
+global S7ReplyTimeoutMs := 1500
 
 ; select() polling interval.
 global S7PollIntervalMs := 10
@@ -682,7 +687,7 @@ AdjustS7(Direction)
 
 S7FaceFocus()
 {
-    ; 04 = Face Focus
+    ; Mode 4 = Face Focus (derived from Wireshark capture)
     SendS7FocusCommand(4, "Face Focus")
 }
 
@@ -693,18 +698,26 @@ S7FaceFocus()
 
 S7AutoFocusCenter()
 {
-    ; 03 = Auto-Focus Center
-    SendS7FocusCommand(3, "Auto-Focus Center")
+    ; Mode 3 = AF-C (derived from Wireshark capture)
+    SendS7FocusCommand(3, "AF-C")
 }
 
 
 ; ============================================================
 ; S7 - SEND FOCUS COMMAND
+;
+; Same sequence Compose uses:
+;   1. Refuse if another program is connected to the camera.
+;      Two simultaneous connections can wedge the camera
+;      until it is power cycled.
+;   2. Connect.
+;   3. Set the focus mode and wait for the matching reply.
+;   4. Read the focus mode back to confirm it changed.
+;   5. Close.
 ; ============================================================
 
 SendS7FocusCommand(Mode, Description)
 {
-    global S7FocusCounter
     global S7FocusBusy
 
     ; Prevent multiple focus commands from overlapping.
@@ -717,9 +730,17 @@ SendS7FocusCommand(Mode, Description)
     S7FocusBusy := true
 
     Log("----------------------------------------")
-    Log("S7 FOCUS: " . Description)
-    Log("S7 FOCUS counter: " . Format("{:02X}", S7FocusCounter))
-    Log("S7 FOCUS mode: " . Mode)
+    Log("S7 FOCUS: " . Description . " (mode " . Mode . ")")
+
+    OtherClient := GetS7OtherClient()
+
+    if (OtherClient != "")
+    {
+        Log("S7 FOCUS ABORTED: camera already connected to " . OtherClient)
+        ShowFocusStatus("S7 Focus: " . OtherClient . " is connected to the camera.`nClose it first.", 3000)
+        S7FocusBusy := false
+        return false
+    }
 
     if !EnsureS7FocusConnection()
     {
@@ -729,116 +750,216 @@ SendS7FocusCommand(Mode, Description)
         return false
     }
 
-    ; ========================================================
-    ; Build the 26-byte focus packet.
-    ;
-    ; Captured format:
-    ;
-    ; 08 01 00 00 12 00 00 00
-    ; A5 00 00 00
-    ; 0A AF
-    ; 08 02
-    ; 10 COUNTER
-    ; 28 17
-    ; 32 02
-    ; 08 MODE
-    ; CHECKSUM
-    ; 5A
-    ; ========================================================
+    ; Set: type 2, counter, command 23 (focus mode), params {1: Mode}
+    SetCounter := NextS7FocusCounter()
+    Reply := SendS7FocusRequest([0x08, 0x02, 0x10, SetCounter, 0x28, 0x17, 0x32, 0x02, 0x08, Mode], SetCounter)
 
-    Counter := S7FocusCounter & 0xFF
-
-    ; Checksum observed in capture:
-    ;
-    ; checksum = counter XOR mode XOR 1D
-
-    Checksum := Counter ^ Mode ^ 0x1D
-
-    VarSetCapacity(Packet, 26, 0)
-
-    NumPut(0x08, Packet,  0, "UChar")
-    NumPut(0x01, Packet,  1, "UChar")
-    NumPut(0x00, Packet,  2, "UChar")
-    NumPut(0x00, Packet,  3, "UChar")
-
-    NumPut(0x12, Packet,  4, "UChar")
-    NumPut(0x00, Packet,  5, "UChar")
-    NumPut(0x00, Packet,  6, "UChar")
-    NumPut(0x00, Packet,  7, "UChar")
-
-    NumPut(0xA5, Packet,  8, "UChar")
-    NumPut(0x00, Packet,  9, "UChar")
-    NumPut(0x00, Packet, 10, "UChar")
-    NumPut(0x00, Packet, 11, "UChar")
-
-    NumPut(0x0A, Packet, 12, "UChar")
-    NumPut(0xAF, Packet, 13, "UChar")
-
-    NumPut(0x08, Packet, 14, "UChar")
-    NumPut(0x02, Packet, 15, "UChar")
-
-    NumPut(0x10, Packet, 16, "UChar")
-    NumPut(Counter, Packet, 17, "UChar")
-
-    NumPut(0x28, Packet, 18, "UChar")
-    NumPut(0x17, Packet, 19, "UChar")
-
-    NumPut(0x32, Packet, 20, "UChar")
-    NumPut(0x02, Packet, 21, "UChar")
-
-    NumPut(0x08, Packet, 22, "UChar")
-    NumPut(Mode,  Packet, 23, "UChar")
-
-    NumPut(Checksum, Packet, 24, "UChar")
-    NumPut(0x5A, Packet, 25, "UChar")
-
-    Hex := S7BufferToHex(Packet, 26)
-
-    Log("S7 FOCUS TX: " . Hex)
-
-    ; ========================================================
-    ; Send 26-byte command.
-    ; ========================================================
-
-    Sent := SendS7FocusData(Packet, 26)
-
-    if (Sent != 26)
+    if (!IsObject(Reply) || Reply.Status != 200)
     {
-        ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+        Status := IsObject(Reply) ? "status " . Reply.Status : "no reply"
 
-        Log("S7 FOCUS SEND FAILED. Sent=" . Sent . " Error=" . ErrorCode)
+        Log("S7 FOCUS SET FAILED: " . Status)
 
         CloseS7FocusConnection()
 
-        ShowFocusStatus("S7 Focus: SEND FAILED")
+        ShowFocusStatus("S7 Focus: " . Description . " FAILED (" . Status . ")", 3000)
 
         S7FocusBusy := false
 
         return false
     }
 
-    Log("S7 FOCUS TX OK: 26 bytes")
+    ; Get: type 1, counter, command 23 (focus mode)
+    GetCounter := NextS7FocusCounter()
+    Reply := SendS7FocusRequest([0x08, 0x01, 0x10, GetCounter, 0x28, 0x17], GetCounter)
 
-    ; ========================================================
-    ; Read the camera response.
-    ;
-    ; This is now non-blocking. It can never hang AHK.
-    ; ========================================================
+    CloseS7FocusConnection()
 
-    ReceiveS7FocusResponse()
+    ActualMode := IsObject(Reply) ? GetS7ProtoField(Reply.Params, 1) : ""
 
-    ; Increment the application transaction counter.
-    ; Keep this sequencing unchanged.
-    S7FocusCounter := (S7FocusCounter + 1) & 0xFF
-
-    Log("S7 FOCUS next counter: " . Format("{:02X}", S7FocusCounter))
+    Log("S7 FOCUS read-back mode: " . (ActualMode = "" ? "unknown" : ActualMode))
     Log("----------------------------------------")
 
-    ShowFocusStatus("S7 Focus: " . Description)
+    if (ActualMode = Mode)
+        ShowFocusStatus("S7 Focus: " . Description)
+    else if (ActualMode = "")
+        ShowFocusStatus("S7 Focus: " . Description . " sent (not confirmed)", 3000)
+    else
+        ShowFocusStatus("S7 Focus: asked for " . Description . ", camera reports " . S7FocusModeName(ActualMode), 3000)
 
     S7FocusBusy := false
 
     return true
+}
+
+
+; ============================================================
+; S7 - FOCUS MODE NAME
+; ============================================================
+
+S7FocusModeName(Mode)
+{
+    if (Mode = 3)
+        return "AF-C"
+
+    if (Mode = 4)
+        return "Face Focus"
+
+    return "mode " . Mode
+}
+
+
+; ============================================================
+; S7 - NEXT TRANSACTION COUNTER
+;
+; Returns the counter to use and advances it, staying in
+; 1-127 so it always encodes as one protobuf varint byte.
+; ============================================================
+
+NextS7FocusCounter()
+{
+    global S7FocusCounter
+
+    Counter := S7FocusCounter
+
+    if (Counter < 1 || Counter > 127)
+        Counter := 1
+
+    S7FocusCounter := Mod(Counter, 127) + 1
+
+    return Counter
+}
+
+
+; ============================================================
+; S7 - FIND ANOTHER PROGRAM CONNECTED TO THE CAMERA
+;
+; Returns the process name (or PID) holding an established
+; connection to the camera's control port, or "" if none.
+; ============================================================
+
+GetS7OtherClient()
+{
+    global S7FocusIP
+    global S7FocusPort
+
+    TempFile := A_Temp . "\s7_netstat_" . A_TickCount . ".txt"
+
+    Command := ComSpec . " /C netstat -ano -p TCP > """ . TempFile . """"
+
+    RunWait, %Command%, %A_ScriptDir%, Hide
+
+    FileRead, Output, %TempFile%
+
+    FileDelete, %TempFile%
+
+    Remote := S7FocusIP . ":" . S7FocusPort
+
+    Loop, Parse, Output, `n, `r
+    {
+        ; Columns: Proto, Local Address, Foreign Address, State, PID
+        Columns := StrSplit(RegExReplace(Trim(A_LoopField), "\s+", " "), " ")
+
+        if (Columns.Length() >= 5 && Columns[3] = Remote && Columns[4] = "ESTABLISHED")
+        {
+            Pid := Columns[5]
+            Name := GetProcessNameFromPid(Pid)
+
+            return (Name != "") ? Name : "PID " . Pid
+        }
+    }
+
+    return ""
+}
+
+
+GetProcessNameFromPid(Pid)
+{
+    try
+    {
+        for Process in ComObjGet("winmgmts:").ExecQuery("SELECT Name FROM Win32_Process WHERE ProcessId=" . Pid)
+            return Process.Name
+    }
+
+    return ""
+}
+
+
+; ============================================================
+; S7 - SEND REQUEST AND WAIT FOR ITS REPLY
+;
+; Body is the protobuf body as an array of bytes. Returns
+; the parsed reply message, or "" on failure.
+; ============================================================
+
+SendS7FocusRequest(Body, Counter)
+{
+    global S7ReplyTimeoutMs
+
+    Length := BuildS7Packet(Body, Packet)
+
+    Log("S7 FOCUS TX: " . S7BufferToHex(Packet, Length))
+
+    Sent := SendS7FocusData(Packet, Length)
+
+    if (Sent != Length)
+    {
+        ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+        Log("S7 FOCUS SEND FAILED. Sent=" . Sent . " Error=" . ErrorCode)
+
+        return ""
+    }
+
+    return WaitForS7Reply(Counter, S7ReplyTimeoutMs)
+}
+
+
+; ============================================================
+; S7 - BUILD PACKET
+;
+; Captured format:
+;
+; 08 01 00 00               header (01 = PC->camera)
+; LEN LEN LEN LEN           length of everything after this field
+; A5 00 00 00               marker
+; BODYLEN (A5^BODYLEN)      body length and its check byte
+; BODY...                   protobuf body
+; CHECKSUM                  XOR of all body bytes
+; 5A                        end marker
+;
+; Returns the packet length.
+; ============================================================
+
+BuildS7Packet(Body, ByRef Packet)
+{
+    BodyLength := Body.Length()
+    Length := 16 + BodyLength
+
+    VarSetCapacity(Packet, Length, 0)
+
+    NumPut(0x08, Packet, 0, "UChar")
+    NumPut(0x01, Packet, 1, "UChar")
+
+    NumPut(Length - 8, Packet, 4, "UInt")
+
+    NumPut(0xA5, Packet, 8, "UChar")
+
+    NumPut(BodyLength, Packet, 12, "UChar")
+    NumPut(0xA5 ^ BodyLength, Packet, 13, "UChar")
+
+    Checksum := 0
+
+    for Index, Value in Body
+    {
+        NumPut(Value, Packet, 13 + Index, "UChar")
+        Checksum ^= Value
+    }
+
+    NumPut(Checksum, Packet, 14 + BodyLength, "UChar")
+    NumPut(0x5A, Packet, 15 + BodyLength, "UChar")
+
+    return Length
 }
 
 
@@ -958,8 +1079,6 @@ EnsureS7FocusConnection()
 
     ErrorCode := DllCall("Ws2_32\WSAGetLastError")
 
-    ; WSAEWOULDBLOCK / WSAEINPROGRESS / WSAEALREADY are normal
-    ; for a non-blocking connect.
     if (ErrorCode != 10035 && ErrorCode != 10036 && ErrorCode != 10037)
     {
         Log("S7 FOCUS: connect() failed: " . ErrorCode)
@@ -971,11 +1090,7 @@ EnsureS7FocusConnection()
 
     Log("S7 FOCUS: Connect in progress")
 
-    ; --------------------------------------------------------
-    ; Wait for connection to complete using select().
-    ; --------------------------------------------------------
-
-    if !WaitForS7Socket(Socket, 1, S7ConnectTimeoutMs)
+    if !WaitForS7Socket(Socket, 2, S7ConnectTimeoutMs)
     {
         Log("S7 FOCUS: TCP connection timed out")
 
@@ -1073,59 +1188,240 @@ SendS7FocusData(ByRef Buffer, Length)
 
 
 ; ============================================================
-; S7 - RECEIVE FOCUS RESPONSE
+; S7 - WAIT FOR REPLY
+;
+; Reads until a reply (type 4) with the given counter
+; arrives. Face-tracking events (type 5) that arrive in the
+; meantime are counted and skipped. TCP may split or join
+; messages, so bytes are buffered and split by the length
+; field. Returns the parsed reply, or "" on timeout.
 ; ============================================================
 
-ReceiveS7FocusResponse()
+WaitForS7Reply(Counter, TimeoutMs)
 {
     global S7FocusSocket
-    global S7ReceiveTimeoutMs
 
-    VarSetCapacity(Response, 512, 0)
+    Pending := []
+    EventCount := 0
+    Deadline := A_TickCount + TimeoutMs
 
-    ; --------------------------------------------------------
-    ; Wait until data is actually available.
-    ;
-    ; This prevents recv() from ever blocking.
-    ; --------------------------------------------------------
+    VarSetCapacity(Chunk, 2048, 0)
 
-    if !WaitForS7Socket(S7FocusSocket, 1, S7ReceiveTimeoutMs)
+    Loop
     {
-        Log("S7 FOCUS RX: Receive timeout - no response from camera")
+        Remaining := Deadline - A_TickCount
 
-        return false
+        if (Remaining <= 0)
+            break
+
+        if !WaitForS7Socket(S7FocusSocket, 1, Remaining)
+            break
+
+        Received := DllCall("Ws2_32\recv"
+            , "Ptr", S7FocusSocket
+            , "Ptr", &Chunk
+            , "Int", 2048
+            , "Int", 0
+            , "Int")
+
+        if (Received = 0)
+        {
+            Log("S7 FOCUS RX: Camera closed TCP connection")
+            break
+        }
+
+        if (Received < 0)
+        {
+            ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+            Log("S7 FOCUS RX: recv() error " . ErrorCode)
+            break
+        }
+
+        Loop, %Received%
+            Pending.Push(NumGet(Chunk, A_Index - 1, "UChar"))
+
+        while IsObject(Message := TakeS7Message(Pending))
+        {
+            if (Message.Type = 5)
+            {
+                EventCount++
+                continue
+            }
+
+            Log("S7 FOCUS RX: type=" . Message.Type
+                . " counter=" . Message.Counter
+                . " status=" . Message.Status
+                . " command=" . Message.Command
+                . " : " . Message.Hex)
+
+            if (Message.Type = 4 && Message.Counter = Counter)
+            {
+                if (EventCount > 0)
+                    Log("S7 FOCUS RX: skipped " . EventCount . " face-tracking event(s)")
+
+                return Message
+            }
+        }
     }
 
-    Received := DllCall("Ws2_32\recv"
-        , "Ptr", S7FocusSocket
-        , "Ptr", &Response
-        , "Int", 512
-        , "Int", 0
-        , "Int")
+    Log("S7 FOCUS RX: no reply for counter " . Counter . " (skipped " . EventCount . " event(s))")
 
-    if (Received > 0)
+    return ""
+}
+
+
+; ============================================================
+; S7 - TAKE ONE COMPLETE MESSAGE FROM THE RECEIVE BUFFER
+;
+; Removes and parses the first complete message in Pending
+; (an array of bytes). Returns "" if none is complete yet.
+; ============================================================
+
+TakeS7Message(Pending)
+{
+    if (Pending.Length() < 8)
+        return ""
+
+    PayloadLength := Pending[5] | (Pending[6] << 8) | (Pending[7] << 16) | (Pending[8] << 24)
+
+    ; Out of sync or garbage: drop everything buffered.
+    if (PayloadLength < 8 || PayloadLength > 65536)
     {
-        Hex := S7BufferToHex(Response, Received)
-
-        Log("S7 FOCUS RX (" . Received . " bytes): " . Hex)
-
-        return true
+        Log("S7 FOCUS RX: bad message length " . PayloadLength . ", discarding buffer")
+        Pending.RemoveAt(1, Pending.Length())
+        return ""
     }
 
-    if (Received = 0)
+    MessageLength := 8 + PayloadLength
+
+    if (Pending.Length() < MessageLength)
+        return ""
+
+    Bytes := []
+
+    Loop, %MessageLength%
+        Bytes.Push(Pending[A_Index])
+
+    Pending.RemoveAt(1, MessageLength)
+
+    ; Body length at offset 12, body starts at offset 14.
+    BodyLength := Bytes[13]
+    Body := []
+
+    Loop, %BodyLength%
+        Body.Push(Bytes[14 + A_Index])
+
+    Fields := ParseS7Proto(Body)
+
+    return { Type: Fields[1]
+        , Counter: Fields[2]
+        , Status: Fields[4]
+        , Command: Fields[5]
+        , Params: Fields[6]
+        , Hex: S7BytesToHex(Bytes) }
+}
+
+
+; ============================================================
+; S7 - MINIMAL PROTOBUF PARSER
+;
+; Returns an object mapping field number to value: a number
+; for varint fields, an array of bytes for length-delimited
+; fields. Fixed-width fields are skipped.
+; ============================================================
+
+ParseS7Proto(Bytes)
+{
+    Fields := {}
+
+    if !IsObject(Bytes)
+        return Fields
+
+    Index := 1
+    Count := Bytes.Length()
+
+    while (Index <= Count)
     {
-        Log("S7 FOCUS RX: Camera closed TCP connection")
+        Key := ReadS7Varint(Bytes, Index)
+        Field := Key >> 3
+        WireType := Key & 7
 
-        CloseS7FocusConnection()
+        if (WireType = 0)
+        {
+            Fields[Field] := ReadS7Varint(Bytes, Index)
+        }
+        else if (WireType = 2)
+        {
+            Size := ReadS7Varint(Bytes, Index)
+            Value := []
 
-        return false
+            Loop, %Size%
+                Value.Push(Bytes[Index + A_Index - 1])
+
+            Index += Size
+            Fields[Field] := Value
+        }
+        else if (WireType = 5)
+        {
+            Index += 4
+        }
+        else if (WireType = 1)
+        {
+            Index += 8
+        }
+        else
+        {
+            break
+        }
     }
 
-    ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+    return Fields
+}
 
-    Log("S7 FOCUS RX: recv() error " . ErrorCode)
 
-    return false
+ReadS7Varint(Bytes, ByRef Index)
+{
+    Value := 0
+    Shift := 0
+
+    while (Index <= Bytes.Length())
+    {
+        Byte := Bytes[Index]
+        Index += 1
+
+        Value |= (Byte & 0x7F) << Shift
+
+        if !(Byte & 0x80)
+            break
+
+        Shift += 7
+    }
+
+    return Value
+}
+
+
+GetS7ProtoField(Bytes, Field)
+{
+    Fields := ParseS7Proto(Bytes)
+
+    return Fields.HasKey(Field) ? Fields[Field] : ""
+}
+
+
+S7BytesToHex(Bytes)
+{
+    Hex := ""
+
+    for Index, Value in Bytes
+    {
+        if (Index > 1)
+            Hex .= " "
+
+        Hex .= Format("{:02X}", Value)
+    }
+
+    return Hex
 }
 
 
@@ -1148,12 +1444,6 @@ WaitForS7Socket(Socket, Mode, TimeoutMs)
     VarSetCapacity(WriteSet, 512, 0)
     VarSetCapacity(ExceptionSet, 512, 0)
 
-    ; fd_set structure on 64-bit Windows:
-    ; u_int fd_count
-    ; SOCKET fd_array[64]
-    ;
-    ; SOCKET is 64-bit on Win64.
-
     if (Mode = 1)
     {
         NumPut(1, ReadSet, 0, "UInt")
@@ -1171,10 +1461,10 @@ WaitForS7Socket(Socket, Mode, TimeoutMs)
     Seconds := Floor(TimeoutMs / 1000)
     Microseconds := Mod(TimeoutMs, 1000) * 1000
 
-    VarSetCapacity(TimeValue, 16, 0)
+    VarSetCapacity(TimeValue, 8, 0)
 
     NumPut(Seconds, TimeValue, 0, "Int")
-    NumPut(Microseconds, TimeValue, 8, "Int")
+    NumPut(Microseconds, TimeValue, 4, "Int")
 
     Result := DllCall("Ws2_32\select"
         , "Int", 0
@@ -1184,7 +1474,20 @@ WaitForS7Socket(Socket, Mode, TimeoutMs)
         , "Ptr", &TimeValue
         , "Int")
 
-    return (Result > 0)
+    if (Result > 0)
+        return true
+
+    if (Result = 0)
+    {
+        Log("S7 FOCUS: select() timeout. Mode=" . Mode . " Timeout=" . TimeoutMs . "ms")
+        return false
+    }
+
+    ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+    Log("S7 FOCUS: select() failed. Error=" . ErrorCode)
+
+    return false
 }
 
 
@@ -1230,10 +1533,10 @@ CleanupS7Winsock()
 ; S7 - FOCUS STATUS TOOLTIP
 ; ============================================================
 
-ShowFocusStatus(Message)
+ShowFocusStatus(Message, DurationMs := 1000)
 {
     ToolTip, %Message%
-    SetTimer, RemoveToolTip, -1000
+    SetTimer, RemoveToolTip, % -DurationMs
 }
 
 
