@@ -6,11 +6,19 @@ SendMode Input
 SetWorkingDir %A_ScriptDir%
 
 ; ============================================================
-; YoloCam S3 + Yololiv S7 Zoom + Focus Controller
+; Webcam Zoom + Focus Controller
+;
+; Camera 1 - Talking Head : Yololiv S7 (zoom over USB with
+;                           CamParam.exe, focus over TCP)
+; Camera 2 - Top Down     : YoloCam S3 (zoom with S3 tool)
+; Camera 3 - Side         : YoloCam S3 (zoom with S3 tool)
+;
 ; AutoHotkey v1.1.36.02 Unicode 64-bit
 ; ============================================================
 
 global ZoomStepPct := 5
+
+global CameraNames := {1: "Talking Head", 2: "Top Down", 3: "Side"}
 
 
 ; ============================================================
@@ -19,13 +27,11 @@ global ZoomStepPct := 5
 
 global S3Exe := A_ScriptDir . "\yolocam-s3-zoom\yolocam-s3-zoom-multi-win64.exe"
 
-global S3IP1 := "192.168.127.10"
-global S3IP2 := "192.168.124.10"
-global S3IP3 := "192.168.123.10"
+; Keyed by camera number.
+global S3IP := {2: "192.168.124.10", 3: "192.168.123.10"}
 
-global S3Zoom1 := 0
-global S3Zoom2 := 0
-global S3Zoom3 := 0
+; Current zoom per camera, 0-100%.
+global S3Zoom := {2: 0, 3: 0}
 
 
 ; ============================================================
@@ -55,7 +61,7 @@ global S7FocusPort := 12345
 global S7FocusCounter := 0x31
 
 ; TCP socket. Opened per focus command and closed after
-; the reply so unread camera events never pile up.
+; the reply, the same way Compose does it.
 global S7FocusSocket := -1
 
 ; Winsock initialization state.
@@ -72,8 +78,9 @@ global S7SendTimeoutMs := 500
 ; Face-tracking events arriving meanwhile are skipped.
 global S7ReplyTimeoutMs := 1500
 
-; select() polling interval.
-global S7PollIntervalMs := 10
+; How long to wait for the camera to close its side of the
+; connection after we finish.
+global S7CloseTimeoutMs := 1000
 
 
 ; ============================================================
@@ -83,6 +90,12 @@ global S7PollIntervalMs := 10
 global LogFolder := A_ScriptDir . "\logs"
 global LogFileName := "webcamzoom.log"
 
+; When the log passes this size it is renamed to
+; LogOldFileName (replacing any previous one) and a new
+; log is started.
+global LogMaxBytes := 1024 * 1024
+global LogOldFileName := "webcamzoom.old.log"
+
 
 ; ============================================================
 ; STARTUP
@@ -91,12 +104,13 @@ global LogFileName := "webcamzoom.log"
 if !FileExist(LogFolder)
     FileCreateDir, %LogFolder%
 
+OnExit("WebcamZoomExit")
+
 Log("========================================")
 Log("Webcam Zoom Controller starting")
 Log("S3 EXE: " . S3Exe)
-Log("S3 IP1: " . S3IP1)
-Log("S3 IP2: " . S3IP2)
-Log("S3 IP3: " . S3IP3)
+Log("S3 Top Down IP: " . S3IP[2])
+Log("S3 Side IP: " . S3IP[3])
 Log("S7 Serial: " . S7Serial)
 Log("S7 Focus IP: " . S7FocusIP)
 Log("S7 Focus Port: " . S7FocusPort)
@@ -114,22 +128,22 @@ return
 
 
 ; ============================================================
-; CAMERA 1 - TALKING HEAD
+; CAMERA 1 - TALKING HEAD (S7)
 ; ============================================================
 
 ^#1::
     Log("HOTKEY: Ctrl+Win+1")
-    AdjustS3(1, 1)
+    AdjustS7(1)
 return
 
 ^#q::
     Log("HOTKEY: Ctrl+Win+Q")
-    AdjustS3(1, -1)
+    AdjustS7(-1)
 return
 
 
 ; ============================================================
-; CAMERA 2 - OVERHEAD
+; CAMERA 2 - TOP DOWN (S3)
 ; ============================================================
 
 ^#2::
@@ -144,7 +158,7 @@ return
 
 
 ; ============================================================
-; CAMERA 3 - SIDE
+; CAMERA 3 - SIDE (S3)
 ; ============================================================
 
 ^#3::
@@ -159,22 +173,7 @@ return
 
 
 ; ============================================================
-; CAMERA 4 - YOLOLIV S7 ZOOM
-; ============================================================
-
-^#4::
-    Log("HOTKEY: Ctrl+Win+4")
-    AdjustS7(1)
-return
-
-^#d::
-    Log("HOTKEY: Ctrl+Win+D")
-    AdjustS7(-1)
-return
-
-
-; ============================================================
-; S7 FOCUS
+; TALKING HEAD (S7) FOCUS
 ; ============================================================
 
 ^#f::
@@ -184,7 +183,7 @@ return
 
 ^#a::
     Log("HOTKEY: Ctrl+Win+A")
-    S7AutoFocusCenter()
+    S7AFCFocus()
 return
 
 
@@ -194,10 +193,9 @@ return
 
 ^#=::
     Log("HOTKEY: Ctrl+Win+=")
-    AdjustS3(1, 1)
+    AdjustS7(1)
     AdjustS3(2, 1)
     AdjustS3(3, 1)
-    AdjustS7(1)
 return
 
 
@@ -207,10 +205,9 @@ return
 
 ^#-::
     Log("HOTKEY: Ctrl+Win+-")
-    AdjustS3(1, -1)
+    AdjustS7(-1)
     AdjustS3(2, -1)
     AdjustS3(3, -1)
-    AdjustS7(-1)
 return
 
 
@@ -230,50 +227,31 @@ return
 
 InitializeCameras()
 {
-    global S3Zoom1
-    global S3Zoom2
-    global S3Zoom3
-    global S7Zoom
-    global S7Min
-    global S7Max
+    global S3IP
+    global S3Zoom
+    global CameraNames
 
     Log("----------------------------------------")
     Log("Starting camera synchronization")
 
     Sleep, 500
 
-    Result1 := SyncS3(1)
-    Result2 := SyncS3(2)
-    Result3 := SyncS3(3)
-
-    Result4 := InitializeS7()
-
     Message := ""
 
-    if (Result1)
-        Message .= "Talking Head: " . S3Zoom1 . "%`n"
+    if InitializeS7()
+        Message .= CameraNames[1] . ": " . S7ZoomPct() . "%`n"
     else
-        Message .= "Talking Head: FAILED`n"
+        Message .= CameraNames[1] . ": FAILED`n"
 
-    if (Result2)
-        Message .= "Overhead: " . S3Zoom2 . "%`n"
-    else
-        Message .= "Overhead: FAILED`n"
-
-    if (Result3)
-        Message .= "Side: " . S3Zoom3 . "%`n"
-    else
-        Message .= "Side: FAILED`n"
-
-    if (Result4)
+    for CameraNum in S3IP
     {
-        S7Pct := Round(((S7Zoom - S7Min) / (S7Max - S7Min)) * 100)
-        Message .= "Yololiv S7: " . S7Pct . "%"
+        if SyncS3(CameraNum)
+            Message .= CameraNames[CameraNum] . ": " . S3Zoom[CameraNum] . "%`n"
+        else
+            Message .= CameraNames[CameraNum] . ": FAILED`n"
     }
-    else
-    {
-        Message .= "Yololiv S7: FAILED"
-    }
+
+    Message := RTrim(Message, "`n")
 
     Log("Synchronization complete")
     Log("----------------------------------------")
@@ -361,32 +339,22 @@ SetS3Zoom(IP, Pct)
 
 SyncS3(CameraNum)
 {
-    global S3IP1
-    global S3IP2
-    global S3IP3
+    global S3IP
+    global S3Zoom
+    global CameraNames
 
-    global S3Zoom1
-    global S3Zoom2
-    global S3Zoom3
-
-    IP := ""
-
-    if (CameraNum = 1)
-        IP := S3IP1
-    else if (CameraNum = 2)
-        IP := S3IP2
-    else if (CameraNum = 3)
-        IP := S3IP3
-    else
+    if !S3IP.HasKey(CameraNum)
         return false
 
-    Log("Syncing S3 Camera " . CameraNum . " at " . IP)
+    IP := S3IP[CameraNum]
+
+    Log("Syncing S3 " . CameraNames[CameraNum] . " at " . IP)
 
     ZoomFactor := GetS3Zoom(IP)
 
     if (ZoomFactor = "")
     {
-        Log("SYNC FAILED - Camera " . CameraNum . " - " . IP)
+        Log("SYNC FAILED - " . CameraNames[CameraNum] . " - " . IP)
         return false
     }
 
@@ -398,14 +366,9 @@ SyncS3(CameraNum)
     if (Pct > 100)
         Pct := 100
 
-    if (CameraNum = 1)
-        S3Zoom1 := Pct
-    else if (CameraNum = 2)
-        S3Zoom2 := Pct
-    else if (CameraNum = 3)
-        S3Zoom3 := Pct
+    S3Zoom[CameraNum] := Pct
 
-    Log("SYNC OK - Camera " . CameraNum . " - " . ZoomFactor . "x = " . Pct . "%")
+    Log("SYNC OK - " . CameraNames[CameraNum] . " - " . ZoomFactor . "x = " . Pct . "%")
 
     return true
 }
@@ -418,34 +381,15 @@ SyncS3(CameraNum)
 AdjustS3(CameraNum, Direction)
 {
     global ZoomStepPct
+    global S3IP
+    global S3Zoom
+    global CameraNames
 
-    global S3Zoom1
-    global S3Zoom2
-    global S3Zoom3
-
-    global S3IP1
-    global S3IP2
-    global S3IP3
-
-    if (CameraNum = 1)
-    {
-        Pct := S3Zoom1
-        IP := S3IP1
-    }
-    else if (CameraNum = 2)
-    {
-        Pct := S3Zoom2
-        IP := S3IP2
-    }
-    else if (CameraNum = 3)
-    {
-        Pct := S3Zoom3
-        IP := S3IP3
-    }
-    else
-    {
+    if !S3IP.HasKey(CameraNum)
         return
-    }
+
+    IP := S3IP[CameraNum]
+    Pct := S3Zoom[CameraNum]
 
     NewPct := Pct + (Direction * ZoomStepPct)
 
@@ -463,14 +407,9 @@ AdjustS3(CameraNum, Direction)
 
     if SetS3Zoom(IP, NewPct)
     {
-        if (CameraNum = 1)
-            S3Zoom1 := NewPct
-        else if (CameraNum = 2)
-            S3Zoom2 := NewPct
-        else if (CameraNum = 3)
-            S3Zoom3 := NewPct
+        S3Zoom[CameraNum] := NewPct
 
-        Log("Camera " . CameraNum . " zoom: " . Pct . "% -> " . NewPct . "%")
+        Log(CameraNames[CameraNum] . " zoom: " . Pct . "% -> " . NewPct . "%")
 
         ShowZoom(CameraNum, NewPct)
     }
@@ -633,6 +572,20 @@ SetS7Zoom(Value)
 
 
 ; ============================================================
+; S7 - ZOOM AS A PERCENTAGE OF ITS RANGE
+; ============================================================
+
+S7ZoomPct()
+{
+    global S7Zoom
+    global S7Min
+    global S7Max
+
+    return Round(((S7Zoom - S7Min) / (S7Max - S7Min)) * 100)
+}
+
+
+; ============================================================
 ; S7 - ADJUST ZOOM
 ; ============================================================
 
@@ -663,8 +616,7 @@ AdjustS7(Direction)
 
     if (NewZoom = S7Zoom)
     {
-        Pct := Round(((NewZoom - S7Min) / (S7Max - S7Min)) * 100)
-        ShowZoom(4, Pct)
+        ShowZoom(1, S7ZoomPct())
         return
     }
 
@@ -672,11 +624,9 @@ AdjustS7(Direction)
     {
         S7Zoom := NewZoom
 
-        Pct := Round(((NewZoom - S7Min) / (S7Max - S7Min)) * 100)
+        Log("S7 zoom: " . S7Zoom . " (" . S7ZoomPct() . "%)")
 
-        Log("S7 zoom: " . S7Zoom . " (" . Pct . "%)")
-
-        ShowZoom(4, Pct)
+        ShowZoom(1, S7ZoomPct())
     }
 }
 
@@ -693,10 +643,10 @@ S7FaceFocus()
 
 
 ; ============================================================
-; S7 - AUTO FOCUS CENTER
+; S7 - AF-C FOCUS
 ; ============================================================
 
-S7AutoFocusCenter()
+S7AFCFocus()
 {
     ; Mode 3 = AF-C (derived from Wireshark capture)
     SendS7FocusCommand(3, "AF-C")
@@ -978,7 +928,7 @@ EnsureS7FocusConnection()
     if (S7FocusSocket != -1)
         return true
 
-    Log("S7 FOCUS: Opening persistent TCP connection")
+    Log("S7 FOCUS: Opening TCP connection")
 
     ; --------------------------------------------------------
     ; Start Winsock
@@ -1493,20 +1443,55 @@ WaitForS7Socket(Socket, Mode, TimeoutMs)
 
 ; ============================================================
 ; S7 - CLOSE FOCUS CONNECTION
+;
+; Graceful close: tell the camera we are done sending, then
+; read and discard anything still arriving (face-tracking
+; events) until the camera closes its side. Closing with
+; unread data makes Windows send a TCP reset instead.
 ; ============================================================
 
 CloseS7FocusConnection()
 {
     global S7FocusSocket
+    global S7CloseTimeoutMs
 
-    if (S7FocusSocket != -1)
+    if (S7FocusSocket = -1)
+        return
+
+    Log("S7 FOCUS: Closing TCP connection")
+
+    ; SD_SEND = 1
+    DllCall("Ws2_32\shutdown", "Ptr", S7FocusSocket, "Int", 1)
+
+    VarSetCapacity(Discard, 2048, 0)
+
+    Deadline := A_TickCount + S7CloseTimeoutMs
+
+    Loop
     {
-        Log("S7 FOCUS: Closing TCP connection")
+        Remaining := Deadline - A_TickCount
 
-        DllCall("Ws2_32\closesocket", "Ptr", S7FocusSocket)
+        if (Remaining <= 0)
+            break
 
-        S7FocusSocket := -1
+        if !WaitForS7Socket(S7FocusSocket, 1, Remaining)
+            break
+
+        Received := DllCall("Ws2_32\recv"
+            , "Ptr", S7FocusSocket
+            , "Ptr", &Discard
+            , "Int", 2048
+            , "Int", 0
+            , "Int")
+
+        ; 0 = camera closed its side, < 0 = error.
+        if (Received <= 0)
+            break
     }
+
+    DllCall("Ws2_32\closesocket", "Ptr", S7FocusSocket)
+
+    S7FocusSocket := -1
 }
 
 
@@ -1568,16 +1553,9 @@ S7BufferToHex(ByRef Buffer, Length)
 
 ShowZoom(CameraNum, Pct)
 {
-    if (CameraNum = 1)
-        Name := "Talking Head"
-    else if (CameraNum = 2)
-        Name := "Overhead"
-    else if (CameraNum = 3)
-        Name := "Side"
-    else if (CameraNum = 4)
-        Name := "Yololiv S7"
-    else
-        Name := "Camera"
+    global CameraNames
+
+    Name := CameraNames.HasKey(CameraNum) ? CameraNames[CameraNum] : "Camera"
 
     ToolTip, %Name% Zoom: %Pct%`%
     SetTimer, RemoveToolTip, -800
@@ -1591,16 +1569,17 @@ return
 
 ; ============================================================
 ; EXIT CLEANUP
+;
+; Registered with OnExit at startup.
 ; ============================================================
 
-WebcamZoomExit:
-    Log("Webcam Zoom Controller exiting")
+WebcamZoomExit(ExitReason, ExitCode)
+{
+    Log("Webcam Zoom Controller exiting (" . ExitReason . ")")
 
     CloseS7FocusConnection()
     CleanupS7Winsock()
-
-    ExitApp
-return
+}
 
 
 ; ============================================================
@@ -1611,8 +1590,27 @@ Log(Message)
 {
     global LogFolder
     global LogFileName
+    global LogOldFileName
+    global LogMaxBytes
+
+    static WriteCount := 0
+
+    LogPath := LogFolder . "\" . LogFileName
+
+    ; Check the size on the first write and every 100 after.
+    ; Past the limit, the log becomes the .old log (replacing
+    ; any previous one) and a new log starts.
+    if (Mod(WriteCount, 100) = 0)
+    {
+        FileGetSize, LogSize, %LogPath%
+
+        if (!ErrorLevel && LogSize > LogMaxBytes)
+            FileMove, %LogPath%, %LogFolder%\%LogOldFileName%, 1
+    }
+
+    WriteCount += 1
 
     FormatTime, TimeStamp,, yyyy-MM-dd HH:mm:ss
 
-    FileAppend, %TimeStamp% - %Message%`r`n, %LogFolder%\%LogFileName%
+    FileAppend, %TimeStamp% - %Message%`r`n, %LogPath%
 }
