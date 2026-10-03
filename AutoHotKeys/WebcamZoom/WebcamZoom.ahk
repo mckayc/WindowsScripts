@@ -49,7 +49,7 @@ global CamParamExe := A_ScriptDir . "\CamParam.exe"
 global S7FocusIP := "192.168.127.10"
 global S7FocusPort := 12345
 
-; The captured application protocol uses an incrementing
+; Captured application protocol uses an incrementing
 ; transaction counter.
 global S7FocusCounter := 0x31
 
@@ -58,6 +58,17 @@ global S7FocusSocket := -1
 
 ; Winsock initialization state.
 global S7WinsockStarted := false
+
+; Prevent overlapping focus commands.
+global S7FocusBusy := false
+
+; Focus networking timeouts.
+global S7ConnectTimeoutMs := 1000
+global S7SendTimeoutMs := 500
+global S7ReceiveTimeoutMs := 500
+
+; select() polling interval.
+global S7PollIntervalMs := 10
 
 
 ; ============================================================
@@ -102,10 +113,12 @@ return
 ; ============================================================
 
 ^#1::
+    Log("HOTKEY: Ctrl+Win+1")
     AdjustS3(1, 1)
 return
 
 ^#q::
+    Log("HOTKEY: Ctrl+Win+Q")
     AdjustS3(1, -1)
 return
 
@@ -115,10 +128,12 @@ return
 ; ============================================================
 
 ^#2::
+    Log("HOTKEY: Ctrl+Win+2")
     AdjustS3(2, 1)
 return
 
 ^#w::
+    Log("HOTKEY: Ctrl+Win+W")
     AdjustS3(2, -1)
 return
 
@@ -128,10 +143,12 @@ return
 ; ============================================================
 
 ^#3::
+    Log("HOTKEY: Ctrl+Win+3")
     AdjustS3(3, 1)
 return
 
 ^#e::
+    Log("HOTKEY: Ctrl+Win+E")
     AdjustS3(3, -1)
 return
 
@@ -141,10 +158,12 @@ return
 ; ============================================================
 
 ^#4::
+    Log("HOTKEY: Ctrl+Win+4")
     AdjustS7(1)
 return
 
 ^#d::
+    Log("HOTKEY: Ctrl+Win+D")
     AdjustS7(-1)
 return
 
@@ -154,10 +173,12 @@ return
 ; ============================================================
 
 ^#f::
+    Log("HOTKEY: Ctrl+Win+F")
     S7FaceFocus()
 return
 
 ^#a::
+    Log("HOTKEY: Ctrl+Win+A")
     S7AutoFocusCenter()
 return
 
@@ -167,6 +188,7 @@ return
 ; ============================================================
 
 ^#=::
+    Log("HOTKEY: Ctrl+Win+=")
     AdjustS3(1, 1)
     AdjustS3(2, 1)
     AdjustS3(3, 1)
@@ -179,6 +201,7 @@ return
 ; ============================================================
 
 ^#-::
+    Log("HOTKEY: Ctrl+Win+-")
     AdjustS3(1, -1)
     AdjustS3(2, -1)
     AdjustS3(3, -1)
@@ -191,6 +214,7 @@ return
 ; ============================================================
 
 ^#r::
+    Log("HOTKEY: Ctrl+Win+R")
     InitializeCameras()
 return
 
@@ -681,6 +705,16 @@ S7AutoFocusCenter()
 SendS7FocusCommand(Mode, Description)
 {
     global S7FocusCounter
+    global S7FocusBusy
+
+    ; Prevent multiple focus commands from overlapping.
+    if (S7FocusBusy)
+    {
+        Log("S7 FOCUS: Command ignored because another focus command is active")
+        return false
+    }
+
+    S7FocusBusy := true
 
     Log("----------------------------------------")
     Log("S7 FOCUS: " . Description)
@@ -691,13 +725,14 @@ SendS7FocusCommand(Mode, Description)
     {
         Log("S7 FOCUS FAILED: Could not establish TCP connection")
         ShowFocusStatus("S7 Focus: CONNECTION FAILED")
+        S7FocusBusy := false
         return false
     }
 
     ; ========================================================
     ; Build the 26-byte focus packet.
     ;
-    ; Capture format:
+    ; Captured format:
     ;
     ; 08 01 00 00 12 00 00 00
     ; A5 00 00 00
@@ -713,7 +748,7 @@ SendS7FocusCommand(Mode, Description)
 
     Counter := S7FocusCounter & 0xFF
 
-    ; Checksum observed in the capture:
+    ; Checksum observed in capture:
     ;
     ; checksum = counter XOR mode XOR 1D
 
@@ -728,8 +763,8 @@ SendS7FocusCommand(Mode, Description)
 
     NumPut(0x12, Packet,  4, "UChar")
     NumPut(0x00, Packet,  5, "UChar")
-    NumPut(0x00, Packet, 6, "UChar")
-    NumPut(0x00, Packet, 7, "UChar")
+    NumPut(0x00, Packet,  6, "UChar")
+    NumPut(0x00, Packet,  7, "UChar")
 
     NumPut(0xA5, Packet,  8, "UChar")
     NumPut(0x00, Packet,  9, "UChar")
@@ -765,7 +800,7 @@ SendS7FocusCommand(Mode, Description)
     ; Send 26-byte command.
     ; ========================================================
 
-    Sent := DllCall("Ws2_32\send", "Ptr", S7FocusSocket, "Ptr", &Packet, "Int", 26, "Int", 0, "Int")
+    Sent := SendS7FocusData(Packet, 26)
 
     if (Sent != 26)
     {
@@ -777,6 +812,8 @@ SendS7FocusCommand(Mode, Description)
 
         ShowFocusStatus("S7 Focus: SEND FAILED")
 
+        S7FocusBusy := false
+
         return false
     }
 
@@ -784,17 +821,22 @@ SendS7FocusCommand(Mode, Description)
 
     ; ========================================================
     ; Read the camera response.
+    ;
+    ; This is now non-blocking. It can never hang AHK.
     ; ========================================================
 
     ReceiveS7FocusResponse()
 
     ; Increment the application transaction counter.
+    ; Keep this sequencing unchanged.
     S7FocusCounter := (S7FocusCounter + 1) & 0xFF
 
     Log("S7 FOCUS next counter: " . Format("{:02X}", S7FocusCounter))
     Log("----------------------------------------")
 
     ShowFocusStatus("S7 Focus: " . Description)
+
+    S7FocusBusy := false
 
     return true
 }
@@ -810,6 +852,7 @@ EnsureS7FocusConnection()
     global S7FocusPort
     global S7FocusSocket
     global S7WinsockStarted
+    global S7ConnectTimeoutMs
 
     if (S7FocusSocket != -1)
         return true
@@ -853,12 +896,30 @@ EnsureS7FocusConnection()
     }
 
     ; --------------------------------------------------------
-    ; Receive timeout = 500 ms
+    ; Make socket non-blocking.
+    ; FIONBIO = 0x8004667E
     ; --------------------------------------------------------
 
-    Timeout := 500
+    NonBlocking := 1
 
-    DllCall("Ws2_32\setsockopt", "Ptr", Socket, "Int", 0xFFFF, "Int", 0x1006, "Ptr", &Timeout, "Int", 4, "Int")
+    Result := DllCall("Ws2_32\ioctlsocket"
+        , "Ptr", Socket
+        , "UInt", 0x8004667E
+        , "UInt*", NonBlocking
+        , "Int")
+
+    if (Result != 0)
+    {
+        ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+        Log("S7 FOCUS: ioctlsocket() failed: " . ErrorCode)
+
+        DllCall("Ws2_32\closesocket", "Ptr", Socket)
+
+        return false
+    }
+
+    Log("S7 FOCUS: Socket set to non-blocking")
 
     ; --------------------------------------------------------
     ; Build sockaddr_in
@@ -877,16 +938,81 @@ EnsureS7FocusConnection()
     NumPut(IPAddress, SocketAddress, 4, "UInt")
 
     ; --------------------------------------------------------
-    ; Connect
+    ; Start non-blocking connect
     ; --------------------------------------------------------
 
-    Result := DllCall("Ws2_32\connect", "Ptr", Socket, "Ptr", &SocketAddress, "Int", 16, "Int")
+    Result := DllCall("Ws2_32\connect"
+        , "Ptr", Socket
+        , "Ptr", &SocketAddress
+        , "Int", 16
+        , "Int")
 
-    if (Result != 0)
+    if (Result = 0)
+    {
+        S7FocusSocket := Socket
+
+        Log("S7 FOCUS: TCP connection established immediately")
+
+        return true
+    }
+
+    ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+    ; WSAEWOULDBLOCK / WSAEINPROGRESS / WSAEALREADY are normal
+    ; for a non-blocking connect.
+    if (ErrorCode != 10035 && ErrorCode != 10036 && ErrorCode != 10037)
+    {
+        Log("S7 FOCUS: connect() failed: " . ErrorCode)
+
+        DllCall("Ws2_32\closesocket", "Ptr", Socket)
+
+        return false
+    }
+
+    Log("S7 FOCUS: Connect in progress")
+
+    ; --------------------------------------------------------
+    ; Wait for connection to complete using select().
+    ; --------------------------------------------------------
+
+    if !WaitForS7Socket(Socket, 1, S7ConnectTimeoutMs)
+    {
+        Log("S7 FOCUS: TCP connection timed out")
+
+        DllCall("Ws2_32\closesocket", "Ptr", Socket)
+
+        return false
+    }
+
+    ; --------------------------------------------------------
+    ; Check SO_ERROR.
+    ; --------------------------------------------------------
+
+    SOError := 0
+    OptLen := 4
+
+    GetsockResult := DllCall("Ws2_32\getsockopt"
+        , "Ptr", Socket
+        , "Int", 0xFFFF
+        , "Int", 0x1007
+        , "Int*", SOError
+        , "Int*", OptLen
+        , "Int")
+
+    if (GetsockResult != 0)
     {
         ErrorCode := DllCall("Ws2_32\WSAGetLastError")
 
-        Log("S7 FOCUS: connect() failed: " . ErrorCode)
+        Log("S7 FOCUS: getsockopt() failed: " . ErrorCode)
+
+        DllCall("Ws2_32\closesocket", "Ptr", Socket)
+
+        return false
+    }
+
+    if (SOError != 0)
+    {
+        Log("S7 FOCUS: TCP connection failed. SO_ERROR=" . SOError)
 
         DllCall("Ws2_32\closesocket", "Ptr", Socket)
 
@@ -902,16 +1028,80 @@ EnsureS7FocusConnection()
 
 
 ; ============================================================
+; S7 - SEND DATA WITH TIMEOUT
+; ============================================================
+
+SendS7FocusData(ByRef Buffer, Length)
+{
+    global S7FocusSocket
+    global S7SendTimeoutMs
+
+    TotalSent := 0
+
+    while (TotalSent < Length)
+    {
+        if !WaitForS7Socket(S7FocusSocket, 2, S7SendTimeoutMs)
+        {
+            Log("S7 FOCUS SEND: Send timeout")
+
+            return TotalSent
+        }
+
+        Remaining := Length - TotalSent
+
+        Sent := DllCall("Ws2_32\send"
+            , "Ptr", S7FocusSocket
+            , "Ptr", (&Buffer + TotalSent)
+            , "Int", Remaining
+            , "Int", 0
+            , "Int")
+
+        if (Sent <= 0)
+        {
+            ErrorCode := DllCall("Ws2_32\WSAGetLastError")
+
+            Log("S7 FOCUS SEND: send() failed. Error=" . ErrorCode)
+
+            return TotalSent
+        }
+
+        TotalSent += Sent
+    }
+
+    return TotalSent
+}
+
+
+; ============================================================
 ; S7 - RECEIVE FOCUS RESPONSE
 ; ============================================================
 
 ReceiveS7FocusResponse()
 {
     global S7FocusSocket
+    global S7ReceiveTimeoutMs
 
     VarSetCapacity(Response, 512, 0)
 
-    Received := DllCall("Ws2_32\recv", "Ptr", S7FocusSocket, "Ptr", &Response, "Int", 512, "Int", 0, "Int")
+    ; --------------------------------------------------------
+    ; Wait until data is actually available.
+    ;
+    ; This prevents recv() from ever blocking.
+    ; --------------------------------------------------------
+
+    if !WaitForS7Socket(S7FocusSocket, 1, S7ReceiveTimeoutMs)
+    {
+        Log("S7 FOCUS RX: Receive timeout - no response from camera")
+
+        return false
+    }
+
+    Received := DllCall("Ws2_32\recv"
+        , "Ptr", S7FocusSocket
+        , "Ptr", &Response
+        , "Int", 512
+        , "Int", 0
+        , "Int")
 
     if (Received > 0)
     {
@@ -936,6 +1126,65 @@ ReceiveS7FocusResponse()
     Log("S7 FOCUS RX: recv() error " . ErrorCode)
 
     return false
+}
+
+
+; ============================================================
+; S7 - WAIT FOR SOCKET
+;
+; Mode:
+;   1 = readable
+;   2 = writable
+;
+; Uses select() so the socket can never block AHK.
+; ============================================================
+
+WaitForS7Socket(Socket, Mode, TimeoutMs)
+{
+    if (Socket = -1)
+        return false
+
+    VarSetCapacity(ReadSet, 512, 0)
+    VarSetCapacity(WriteSet, 512, 0)
+    VarSetCapacity(ExceptionSet, 512, 0)
+
+    ; fd_set structure on 64-bit Windows:
+    ; u_int fd_count
+    ; SOCKET fd_array[64]
+    ;
+    ; SOCKET is 64-bit on Win64.
+
+    if (Mode = 1)
+    {
+        NumPut(1, ReadSet, 0, "UInt")
+        NumPut(Socket, ReadSet, 8, "Ptr")
+    }
+    else
+    {
+        NumPut(1, WriteSet, 0, "UInt")
+        NumPut(Socket, WriteSet, 8, "Ptr")
+    }
+
+    NumPut(1, ExceptionSet, 0, "UInt")
+    NumPut(Socket, ExceptionSet, 8, "Ptr")
+
+    Seconds := Floor(TimeoutMs / 1000)
+    Microseconds := Mod(TimeoutMs, 1000) * 1000
+
+    VarSetCapacity(TimeValue, 16, 0)
+
+    NumPut(Seconds, TimeValue, 0, "Int")
+    NumPut(Microseconds, TimeValue, 8, "Int")
+
+    Result := DllCall("Ws2_32\select"
+        , "Int", 0
+        , "Ptr", &ReadSet
+        , "Ptr", &WriteSet
+        , "Ptr", &ExceptionSet
+        , "Ptr", &TimeValue
+        , "Int")
+
+    return (Result > 0)
 }
 
 
@@ -971,6 +1220,8 @@ CleanupS7Winsock()
         DllCall("Ws2_32\WSACleanup")
 
         S7WinsockStarted := false
+
+        Log("S7 FOCUS: Winsock cleaned up")
     }
 }
 
@@ -1032,6 +1283,20 @@ ShowZoom(CameraNum, Pct)
 
 RemoveToolTip:
     ToolTip
+return
+
+
+; ============================================================
+; EXIT CLEANUP
+; ============================================================
+
+WebcamZoomExit:
+    Log("Webcam Zoom Controller exiting")
+
+    CloseS7FocusConnection()
+    CleanupS7Winsock()
+
+    ExitApp
 return
 
 
