@@ -1,0 +1,36 @@
+=== Plex client-address diagnostic ===
+Server: http://192.168.1.111:32400
+Looking for client named: 'GMKTekNucBox'
+
+--- A. Server /clients (raw attributes) ---
+HTTP 200
+  {'name': 'GMKTekNucBox', 'host': '192.168.1.111', 'address': '192.168.1.111', 'port': '32500', 'machineIdentifier': 'fe1d51bf-9d37-4c11-977b-ca6428086026', 'version': '4.12.3', 'protocol': 'plex', 'product': 'Plexamp', 'deviceClass': 'pc', 'protocolVersion': '1', 'protocolCapabilities': 'timeline,playback,playqueues,playqueues-creation'}
+
+--- B. plex.tv /api/resources (devices + connections) ---
+HTTP 200
+  Device: 'omv-beelink' product=Plex Media Server provides=server clientIdentifier=bad1dcc18cee9c2b202c960842970bc128a9a54a   (not a player, connections skipped)
+  Device: 'GMKTekNucBox' product=Plexamp provides=client,player,pubsub-player clientIdentifier=fe1d51bf-9d37-4c11-977b-ca6428086026
+      connection: address=192.168.1.222 port=32500 local=1 protocol=http uri=http://192.168.1.222:32500
+      connection: address=192.168.127.11 port=32500 local=1 protocol=http uri=http://192.168.127.11:32500
+      connection: address=192.168.124.11 port=32500 local=1 protocol=http uri=http://192.168.124.11:32500
+      connection: address=192.168.123.11 port=32500 local=1 protocol=http uri=http://192.168.123.11:32500
+      connection: address=172.17.240.1 port=32500 local=1 protocol=http uri=http://172.17.240.1:32500
+      connection: address=100.79.236.62 port=32500 local=0 protocol=http uri=http://100.79.236.62:32500
+
+--- C. Probing each local player connection: GET <uri>/resources ---
+  http://192.168.1.222:32500/resources -> HTTP 200  <MediaContainer size="1"><Player machineIdentifier="fe1d51bf-9d37-4c11-977b-ca6428086026" deviceClass="pc" platform="Windows" platformVersion="10.0.26200" produ
+  *** THIS ONE ANSWERS. Put this in config.json:  "client_url": "http://192.168.1.222:32500"  ***
+  http://192.168.127.11:32500/resources -> HTTP 200  <MediaContainer size="1"><Player machineIdentifier="fe1d51bf-9d37-4c11-977b-ca6428086026" deviceClass="pc" platform="Windows" platformVersion="10.0.26200" produ
+  *** THIS ONE ANSWERS. Put this in config.json:  "client_url": "http://192.168.127.11:32500"  ***
+  http://192.168.124.11:32500/resources -> HTTP 200  <MediaContainer size="1"><Player machineIdentifier="fe1d51bf-9d37-4c11-977b-ca6428086026" deviceClass="pc" platform="Windows" platformVersion="10.0.26200" produ
+  *** THIS ONE ANSWERS. Put this in config.json:  "client_url": "http://192.168.124.11:32500"  ***
+  http://192.168.123.11:32500/resources -> HTTP 200  <MediaContainer size="1"><Player machineIdentifier="fe1d51bf-9d37-4c11-977b-ca6428086026" deviceClass="pc" platform="Windows" platformVersion="10.0.26200" produ
+  *** THIS ONE ANSWERS. Put this in config.json:  "client_url": "http://192.168.123.11:32500"  ***
+  http://172.17.240.1:32500/resources -> HTTP 200  <MediaContainer size="1"><Player machineIdentifier="fe1d51bf-9d37-4c11-977b-ca6428086026" deviceClass="pc" platform="Windows" platformVersion="10.0.26200" produ
+  *** THIS ONE ANSWERS. Put this in config.json:  "client_url": "http://172.17.240.1:32500"  ***
+
+--- D. Server /status/sessions (what is playing, if anything) ---
+  track='Carrying the Banner' player={'address': '192.168.1.111', 'device': 'Windows', 'machineIdentifier': 'fe1d51bf-9d37-4c11-977b-ca6428086026', 'platform': 'Windows', 'platformVersion': '10.0.26200', 'product': 'Plexamp', 'profile': 'Windows', 'remotePublicAddress': '192.74.128.160', 'state': 'playing', 'title': 'GMKTekNucBox', 'version': '4.12.3', 'local': '1', 'relayed': '0', 'secure': '1', 'userID': '1'}
+  track='Blowing Away' player={'address': '192.168.1.111', 'device': 'Windows', 'machineIdentifier': 'irzlgktcnpiigvnaw93bbpau', 'model': 'bundled', 'platform': 'Chrome', 'platformVersion': '156.0', 'playbackId': '655f064e-1933-44eb-8261-efd0e975913e', 'playbackSessionId': '31e19f92-f1a2-4af5-87ec-73b5b4af13b0', 'product': 'Plex Web', 'profile': 'Web', 'remotePublicAddress': '192.74.128.160', 'state': 'paused', 'title': 'Chrome', 'version': '4.162.1', 'local': '1', 'relayed': '0', 'secure': '1', 'userID': '1'}
+
+Share diagnose_output.txt from this folder if you need help with the result - token is redacted.
